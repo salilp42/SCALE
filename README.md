@@ -83,14 +83,22 @@ The framework consists of three main components:
 
 ```
 SCALE/
-├── model.py                 # Core model implementation
-├── dataset.py              # Data loading and preprocessing
-├── train_all.py            # Training pipeline
-├── visualization/
-│   └── interpretability.py # Visualization tools
-├── colab_package/          # Colab integration utilities
-├── analyze_chestmnist.py   # Example analysis script
-└── requirements.txt        # Project dependencies
+├── src/                    # Source code
+│   ├── models/            # Neural network models
+│   │   └── model.py       # Core model implementation
+│   ├── data/              # Data handling
+│   │   └── dataset.py     # Dataset loading and preprocessing
+│   ├── visualization/     # Visualization tools
+│   │   └── interpretability.py  # Model interpretability
+│   └── utils/             # Utility functions
+│       └── colab_setup.py # Colab integration utilities
+├── scripts/               # Training and analysis scripts
+│   ├── train_all.py      # Main training pipeline
+│   ├── analyze_chestmnist.py  # Analysis examples
+│   └── colab_notebook.py  # Colab integration notebook
+├── requirements.txt       # Project dependencies
+├── LICENSE               # MIT License
+└── README.md            # Project documentation
 ```
 
 ## Data
