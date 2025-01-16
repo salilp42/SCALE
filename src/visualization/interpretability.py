@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import os
 import seaborn as sns
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Tuple, Dict, Union
 from mpl_toolkits.mplot3d import Axes3D
 from scipy.stats import pearsonr
 from sklearn.metrics import mutual_info_score
@@ -17,6 +17,23 @@ from mpl_toolkits.axes_grid1 import ImageGrid
 import traceback
 import gc
 from matplotlib.gridspec import GridSpec
+from matplotlib.colors import LinearSegmentedColormap, Normalize
+import matplotlib.patches as patches
+from matplotlib.collections import PatchCollection
+import matplotlib.patheffects as path_effects
+import colorsys
+
+# Enhanced color maps for medical visualization
+TISSUE_CMAP = LinearSegmentedColormap.from_list('tissue', 
+    ['#313695', '#4575b4', '#74add1', '#abd9e9', '#fee090', '#fdae61', '#f46d43', '#d73027'])
+ATTENTION_CMAP = LinearSegmentedColormap.from_list('attention',
+    [(0, '#FFFFFF00'), (0.2, '#FFE4B522'), (0.5, '#FF990044'), (0.8, '#FF440088'), (1, '#FF0000AA')])
+
+def create_transparent_cmap(base_color: str, name: str = 'custom_transparent') -> LinearSegmentedColormap:
+    """Create a transparent colormap from a base color."""
+    rgb = plt.cm.colors.to_rgb(base_color)
+    colors = [(0, (*rgb, 0)), (1, (*rgb, 1))]
+    return LinearSegmentedColormap.from_list(name, colors)
 
 class ScaleAwareAttention:
     def __init__(self):
@@ -119,6 +136,46 @@ class ScaleAwareAttention:
                                 align_corners=False)
         return attention.squeeze()
 
+    def plot_scale_aware_attention(self, attention_map, save_dir):
+        """Plot scale-aware attention visualization."""
+        try:
+            # Ensure attention_map is on CPU and detached
+            if torch.is_tensor(attention_map):
+                attention_map = attention_map.cpu().detach()
+            
+            # Handle different input shapes
+            if attention_map.ndim == 4:  # [B, C, H, W]
+                attention_map = attention_map[0].mean(dim=0)  # Take first batch and average over channels
+            elif attention_map.ndim == 5:  # [B, C, D, H, W]
+                attention_map = attention_map[0].mean(dim=(0, 1))  # Take first batch and average over channels and depth
+            elif attention_map.ndim == 3:  # [C, H, W]
+                attention_map = attention_map.mean(dim=0)  # Average over channels
+            elif attention_map.ndim == 2:  # [H, W]
+                pass  # Already in correct format
+            
+            # Remove any remaining singleton dimensions
+            attention_map = attention_map.squeeze()
+            
+            # Ensure we have a 2D array for plotting
+            if attention_map.ndim != 2:
+                raise ValueError(f"Unexpected attention map shape: {attention_map.shape}")
+            
+            # Create figure
+            plt.figure(figsize=(8, 8))
+            plt.imshow(attention_map.numpy(), cmap='viridis')
+            plt.colorbar()
+            plt.title('Scale-Aware Attention Map')
+            plt.axis('off')
+            
+            # Save figure
+            save_path = os.path.join(save_dir, 'scale_attention.png')
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            plt.close()
+            
+        except Exception as e:
+            print(f"Warning: Error in plot_scale_aware_attention: {str(e)}")
+            traceback.print_exc()
+
 class CrossModalFeatureMapper:
     def __init__(self):
         self.similarity_threshold = 0.5
@@ -160,8 +217,13 @@ class CrossModalFeatureMapper:
         # Compute cross-modal relationships
         for scale in ['cellular', 'tissue', 'organ']:
             feat_2d = attention_maps[f'2d_{scale}']
+            feat_3d = attention_maps[f'3d_{scale}']
             
-            # Handle both 3D and projected 2D attention maps
+            # Regular 2D similarity
+            similarity = self.compute_feature_similarity_2d(feat_2d, feat_3d)
+            relationships[f'cross_modal_{scale}'] = similarity
+            
+            # Handle 3D attention maps if available
             if f'3d_{scale}_full' in attention_maps:
                 # 3D to 2D projection similarity
                 feat_3d_proj = attention_maps[f'3d_{scale}']
@@ -175,11 +237,6 @@ class CrossModalFeatureMapper:
                     feat_3d_full
                 )
                 relationships[f'cross_modal_{scale}_3d'] = similarity_3d
-            else:
-                # Regular 2D similarity
-                feat_3d = attention_maps[f'3d_{scale}']
-                similarity = self.compute_feature_similarity_2d(feat_2d, feat_3d)
-            relationships[f'cross_modal_{scale}'] = similarity
             
             # Compute scale transitions (e.g., cellular to tissue)
             if scale != 'organ':
@@ -203,203 +260,410 @@ class CrossModalFeatureMapper:
 
 class HierarchicalVizEngine:
     def __init__(self):
-        self.cmap = plt.cm.viridis
-        self.figsize = (15, 10)
+        super().__init__()
+        self.figure_dpi = 300
+        self.subplot_size = 3
         
-    def create_attention_overlay_2d(self, image: torch.Tensor, attention: torch.Tensor) -> np.ndarray:
-        """Create attention overlay on the original 2D image."""
-        # Convert tensors to numpy arrays
-        image_np = image.detach().cpu().numpy()
-        attention_np = attention.detach().cpu().numpy()
+    def create_multi_slice_grid(self, volume: torch.Tensor, attention: Optional[torch.Tensor] = None,
+                              num_slices: int = 9, overlay_alpha: float = 0.4,
+                              att_threshold: float = 0.1, orientation: str = 'axial') -> plt.Figure:
+        """Create an enhanced grid of slices from a 3D volume with optional attention overlay.
         
-        # Handle 4D tensors (B, C, H, W)
-        if len(image_np.shape) == 4:
-            image_np = image_np[0]  # Take first batch
-        if len(attention_np.shape) == 4:
-            attention_np = attention_np[0]  # Take first batch
+        Args:
+            volume (torch.Tensor): Input volume of shape [B, C, D, H, W]
+            attention (Optional[torch.Tensor]): Optional attention map of same shape as volume
+            num_slices (int): Number of slices to display in the grid (default: 9)
+            overlay_alpha (float): Alpha value for attention overlay (default: 0.4)
+            att_threshold (float): Threshold for masking low attention values (default: 0.1)
+            orientation (str): Slice orientation ('axial', 'coronal', 'sagittal') (default: 'axial')
             
-        # Convert to grayscale if needed
-        if image_np.shape[0] == 3:  # RGB
-            image_np = np.transpose(image_np, (1, 2, 0))
-            image_gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
-        else:  # Single channel
-            image_gray = image_np[0]
-            image_np = np.stack([image_gray] * 3, axis=-1)
+        Returns:
+            plt.Figure: Figure containing the multi-slice grid with overlays
+        """
+        if volume.dim() != 5:  # [B, C, D, H, W]
+            raise ValueError(f"Expected 5D volume, got {volume.dim()}D")
             
-        if attention_np.shape[0] > 1:  # Multiple channels
-            attention_np = np.mean(attention_np, axis=0)
+        # Take first batch and channel
+        volume = volume[0, 0].cpu().numpy()
+        if attention is not None:
+            if attention.shape != volume.shape:
+                raise ValueError(f"Attention shape {attention.shape} must match volume shape {volume.shape}")
+            attention = attention[0, 0].cpu().numpy()
+            
+        D = volume.shape[0]
+        
+        # Calculate optimal slice spacing
+        spacing = max(1, D // (num_slices + 1))
+        start_idx = spacing
+        end_idx = D - spacing
+        if num_slices > 1:
+            slice_indices = np.linspace(start_idx, end_idx, num_slices, dtype=int)
         else:
-            attention_np = attention_np[0]
+            slice_indices = [D // 2]  # Middle slice for single-slice case
         
-        # Ensure same dimensions
-        if image_gray.shape != attention_np.shape:
-            attention_np = cv2.resize(attention_np, (image_gray.shape[1], image_gray.shape[0]))
+        # Calculate grid layout
+        n_rows = int(np.sqrt(num_slices))
+        n_cols = int(np.ceil(num_slices / n_rows))
         
-        # Normalize to [0, 1]
-        image_gray = (image_gray - image_gray.min()) / (image_gray.max() - image_gray.min() + 1e-8)
-        attention_np = (attention_np - attention_np.min()) / (attention_np.max() - attention_np.min() + 1e-8)
+        # Create figure with space for colorbar
+        fig = plt.figure(figsize=(n_cols * 4 + 1, n_rows * 4), dpi=self.figure_dpi)
+        gs = GridSpec(n_rows, n_cols, figure=fig)
         
-        # Convert to uint8
-        image_gray = (image_gray * 255).astype(np.uint8)
-        attention_np = (attention_np * 255).astype(np.uint8)
+        # Normalize volume for display
+        volume = (volume - volume.min()) / (volume.max() - volume.min())
         
-        # Create heatmap
-        heatmap = cv2.applyColorMap(attention_np, cv2.COLORMAP_JET)
+        # Store axes for colorbar
+        axes = []
         
-        # Overlay
-        overlay = cv2.addWeighted(cv2.cvtColor(image_gray, cv2.COLOR_GRAY2RGB), 0.7, heatmap, 0.3, 0)
-        
-        return overlay
-    
-    def create_attention_overlay_3d(self, volume: torch.Tensor, attention: torch.Tensor) -> Dict[str, np.ndarray]:
-        """Create attention overlays for 3D volume data."""
-        try:
-            # Convert tensors to numpy arrays
-            volume_np = volume.detach().cpu().numpy()
-            attention_np = attention.detach().cpu().numpy()
+        # Create subplots
+        for idx, slice_idx in enumerate(slice_indices):
+            row = idx // n_cols
+            col = idx % n_cols
+            ax = fig.add_subplot(gs[row, col])
+            axes.append(ax)
             
-            # Handle 5D tensors (B, C, D, H, W)
-            if len(volume_np.shape) == 5:
-                volume_np = volume_np[0]  # Take first batch
-            if len(attention_np.shape) == 5:
-                attention_np = attention_np[0]  # Take first batch
+            # Plot volume slice in grayscale
+            ax.imshow(volume[slice_idx], cmap='gray', interpolation='nearest')
             
-            # Get spatial dimensions
-            d = min(volume_np.shape[-3], attention_np.shape[-3])  # Use minimum depth
-            h = volume_np.shape[-2]
-            w = volume_np.shape[-1]
+            # Overlay attention if provided
+            if attention is not None:
+                # Normalize attention values to [0, 1]
+                att_slice = attention[slice_idx]
+                att_slice = (att_slice - att_slice.min()) / (att_slice.max() - att_slice.min() + 1e-8)
+                
+                # Create masked array for low attention values
+                att_masked = np.ma.masked_where(att_slice < att_threshold, att_slice)
+                
+                # Plot attention overlay with custom colormap
+                ax.imshow(att_masked, cmap=ATTENTION_CMAP, alpha=overlay_alpha,
+                         interpolation='nearest')
             
-            # Resize attention to match volume dimensions if needed
-            if volume_np.shape[-3:] != attention_np.shape[-3:]:
-                resized_attention = np.zeros((attention_np.shape[0], d, h, w))
-                for c in range(attention_np.shape[0]):
-                    for z in range(d):
-                        resized_attention[c, z] = cv2.resize(attention_np[c, min(z, attention_np.shape[1]-1)], (w, h))
-                attention_np = resized_attention
+            # Add slice number and percentage
+            slice_percent = (slice_idx / (D-1)) * 100
+            ax.text(0.02, 0.98, f'Slice {slice_idx} ({slice_percent:.0f}%)', 
+                   transform=ax.transAxes, color='white',
+                   bbox=dict(facecolor='black', alpha=0.7),
+                   verticalalignment='top', fontsize=8)
             
-            # Get middle slices for each axis (safely)
-            mid_d = d // 2
-            mid_h = h // 2
-            mid_w = w // 2
+            # Add anatomical labels based on orientation
+            if orientation.lower() == 'axial':
+                labels = [('A', 0.02, 0.02), ('P', 0.98, 0.02),
+                         ('L', 0.02, 0.5), ('R', 0.98, 0.5)]
+            elif orientation.lower() == 'coronal':
+                labels = [('S', 0.02, 0.02), ('I', 0.98, 0.02),
+                         ('L', 0.02, 0.5), ('R', 0.98, 0.5)]
+            elif orientation.lower() == 'sagittal':
+                labels = [('S', 0.02, 0.02), ('I', 0.98, 0.02),
+                         ('A', 0.02, 0.5), ('P', 0.98, 0.5)]
             
-            slices = {
-                'axial': {'vol': volume_np[:, mid_d, :, :], 'att': attention_np[:, mid_d, :, :]},
-                'sagittal': {'vol': volume_np[:, :mid_d, :, mid_w], 'att': attention_np[:, :mid_d, :, mid_w]},
-                'coronal': {'vol': volume_np[:, :mid_d, mid_h, :], 'att': attention_np[:, :mid_d, mid_h, :]}
-            }
+            for label, x, y in labels:
+                ax.text(x, y, label, transform=ax.transAxes, color='white',
+                       bbox=dict(facecolor='black', alpha=0.7),
+                       ha='left' if x < 0.5 else 'right',
+                       va='bottom' if y < 0.5 else 'center',
+                       fontsize=8)
             
-            overlays = {}
-            for view, data in slices.items():
-                # Create 2D overlay for each view
-                overlays[view] = self.create_attention_overlay_2d(
-                    torch.from_numpy(data['vol']),
-                    torch.from_numpy(data['att'])
-                )
-            
-            return overlays
-        except Exception as e:
-            print(f"Error in 3D attention overlay: {str(e)}")
-            return {'axial': np.zeros((224, 224, 3), dtype=np.uint8)}  # Return black image on error
-    
-    def plot_feature_correlations(self, correlations: torch.Tensor, scale: str, is_3d: bool = False) -> plt.Figure:
-        """Plot feature correlation matrix."""
-        fig = plt.figure(figsize=(8, 8))
-        correlations_np = correlations.detach().cpu().numpy()
+            ax.axis('off')
         
-        if is_3d:
-            # Plot 3D correlations
-            ax = fig.add_subplot(111, projection='3d')
-            x, y, z = np.indices(correlations_np.shape)
-            ax.scatter(x.flatten(), y.flatten(), z.flatten(), 
-                      c=correlations_np.flatten(), cmap='viridis')
-            ax.set_xlabel('Feature X')
-            ax.set_ylabel('Feature Y')
-            ax.set_zlabel('Feature Z')
-        else:
-            # Plot 2D correlations
-            ax = fig.add_subplot(111)
-            sns.heatmap(correlations_np, cmap='viridis', ax=ax)
-            ax.set_xlabel('Feature Index')
-            ax.set_ylabel('Feature Index')
+        # Add colorbar for attention if provided
+        if attention is not None:
+            # Create new axes for colorbar
+            cbar_ax = fig.add_axes([0.92, 0.1, 0.02, 0.8])
+            norm = plt.Normalize(vmin=0, vmax=1)
+            sm = plt.cm.ScalarMappable(cmap=ATTENTION_CMAP, norm=norm)
+            sm.set_array([])
+            cbar = plt.colorbar(sm, cax=cbar_ax)
+            cbar.set_label('Attention', fontsize=10)
+            cbar.ax.tick_params(labelsize=8)
         
-        plt.title(f'Feature Correlations - {scale} scale')
+        # Adjust layout to prevent overlap
+        plt.tight_layout(rect=[0, 0, 0.9 if attention is not None else 1, 1])
+        
+        return fig
+        
+    def create_attention_overlay_2d(self, image: torch.Tensor, attention: torch.Tensor,
+                                  alpha_range: Tuple[float, float] = (0.2, 0.8)) -> np.ndarray:
+        """Create enhanced attention overlay for 2D images."""
+        # Convert to numpy and normalize
+        if isinstance(image, torch.Tensor):
+            image = image.cpu().numpy()
+        if isinstance(attention, torch.Tensor):
+            attention = attention.cpu().numpy()
+            
+        # Ensure correct dimensions
+        if image.ndim == 4:  # [B, C, H, W]
+            image = image[0]
+        if image.ndim == 3:  # [C, H, W]
+            image = np.transpose(image, (1, 2, 0))
+            
+        if attention.ndim == 4:
+            attention = attention[0, 0]
+        elif attention.ndim == 3:
+            attention = attention[0]
+            
+        # Normalize image and attention
+        image = (image - image.min()) / (image.max() - image.min())
+        attention = (attention - attention.min()) / (attention.max() - attention.min())
+        
+        # Create color overlay
+        attention_colored = plt.cm.jet(attention)
+        attention_colored[..., 3] = np.clip(attention, *alpha_range)
+        
+        # Blend
+        result = image.copy()
+        if image.shape[-1] == 1:  # Grayscale
+            result = np.repeat(result, 3, axis=-1)
+        
+        mask = attention_colored[..., 3][..., None]
+        result = result * (1 - mask) + attention_colored[..., :3] * mask
+        
+        return result
+        
+    def create_attention_overlay_3d(self, volume: torch.Tensor, attention: torch.Tensor,
+                                  slices_per_axis: int = 3) -> Dict[str, np.ndarray]:
+        """Create enhanced attention overlays for 3D volumes."""
+        if isinstance(volume, torch.Tensor):
+            volume = volume.cpu().numpy()
+        if isinstance(attention, torch.Tensor):
+            attention = attention.cpu().numpy()
+            
+        # Ensure 5D format [B, C, D, H, W]
+        if volume.ndim == 4:
+            volume = volume[None]
+        if attention.ndim == 4:
+            attention = attention[None]
+            
+        B, C, D, H, W = volume.shape
+        
+        # Get slice indices for each axis
+        d_indices = np.linspace(0, D-1, slices_per_axis, dtype=int)
+        h_indices = np.linspace(0, H-1, slices_per_axis, dtype=int)
+        w_indices = np.linspace(0, W-1, slices_per_axis, dtype=int)
+        
+        results = {}
+        
+        # Create overlays for each axis
+        for axis_name, indices, axis in [('sagittal', w_indices, 4),
+                                       ('coronal', h_indices, 3),
+                                       ('axial', d_indices, 2)]:
+            # Create figure for this axis
+            fig = plt.figure(figsize=(4*slices_per_axis, 4), dpi=self.figure_dpi)
+            gs = GridSpec(1, slices_per_axis)
+            
+            slices = []
+            for idx, slice_idx in enumerate(indices):
+                # Extract slice
+                if axis == 4:  # Sagittal
+                    vol_slice = volume[0, 0, :, :, slice_idx]
+                    att_slice = attention[0, 0, :, :, slice_idx]
+                elif axis == 3:  # Coronal
+                    vol_slice = volume[0, 0, :, slice_idx, :]
+                    att_slice = attention[0, 0, :, slice_idx, :]
+                else:  # Axial
+                    vol_slice = volume[0, 0, slice_idx, :, :]
+                    att_slice = attention[0, 0, slice_idx, :, :]
+                
+                # Create overlay
+                ax = fig.add_subplot(gs[0, idx])
+                im = ax.imshow(vol_slice, cmap='gray')
+                
+                # Add attention overlay with enhanced visibility
+                att_masked = np.ma.masked_where(att_slice < 0.1, att_slice)
+                ax.imshow(att_masked, cmap=ATTENTION_CMAP, alpha=0.6)
+                
+                # Add slice indicator
+                ax.text(0.02, 0.98, f'Slice {slice_idx}',
+                       transform=ax.transAxes, color='white',
+                       bbox=dict(facecolor='black', alpha=0.7),
+                       verticalalignment='top')
+                
+                ax.axis('off')
+                
+            plt.tight_layout()
+            
+            # Convert figure to image array using buffer_rgba
+            fig.canvas.draw()
+            buf = fig.canvas.buffer_rgba()
+            data = np.asarray(buf)
+            results[axis_name] = data
+            plt.close(fig)
+            
+        return results
+        
+    def plot_feature_correlations(self, correlations: torch.Tensor, scale: str,
+                                is_3d: bool = False, enhanced: bool = True) -> plt.Figure:
+        """Plot enhanced feature correlations with improved visibility."""
+        if isinstance(correlations, torch.Tensor):
+            correlations = correlations.cpu().numpy()
+        
+        # Ensure correlations is 2D
+        if correlations.ndim == 1:
+            correlations = correlations.reshape(-1, 1)
+        elif correlations.ndim > 2:
+            correlations = correlations.reshape(correlations.shape[0], -1)
+        
+        fig = plt.figure(figsize=(10, 8), dpi=self.figure_dpi)
+        ax = fig.add_subplot(111)
+        
+        # Use enhanced colormap for better visualization
+        im = ax.imshow(correlations, cmap=TISSUE_CMAP, aspect='auto')
+        
+        if enhanced:
+            # Add correlation values as text
+            for i in range(correlations.shape[0]):
+                for j in range(correlations.shape[1]):
+                    value = correlations[i, j]
+                    text_color = 'white' if abs(value) > 0.5 else 'black'
+                    text = ax.text(j, i, f'{value:.2f}',
+                                 ha='center', va='center', color=text_color,
+                                 fontsize=8, fontweight='bold')
+                    # Add outline for better visibility
+                    text.set_path_effects([
+                        path_effects.Stroke(linewidth=2, foreground='black'),
+                        path_effects.Normal()
+                    ])
+        
+        plt.colorbar(im)
+        
+        # Enhanced title and labels
+        dimension = '3D' if is_3d else '2D'
+        plt.title(f'{dimension} Feature Correlations - {scale} Scale',
+                 pad=20, fontsize=12, fontweight='bold')
+        plt.xlabel('Feature Index', labelpad=10)
+        plt.ylabel('Feature Index', labelpad=10)
+        
+        plt.tight_layout()
         return fig
     
-    def create_visualization(self, 
-                           attention_maps: Dict[str, torch.Tensor],
-                           feature_correlations: Dict[str, torch.Tensor],
-                           original_image_2d: Optional[torch.Tensor] = None,
-                           original_image_3d: Optional[torch.Tensor] = None) -> Dict[str, plt.Figure]:
-        """Generate comprehensive visualization suite."""
-        visualizations = {}
+    def create_visualization(self, attention_maps, feature_correlations, 
+                           original_image_2d=None, original_image_3d=None):
+        """Create comprehensive visualization with enhanced layouts and overlays."""
+        results = {}
         
-        # 1. Multi-scale Attention Visualization
-        fig_attention = plt.figure(figsize=self.figsize)
-        for i, scale in enumerate(['cellular', 'tissue', 'organ']):
-            # 2D attention
-            plt.subplot(2, 3, i + 1)
-            if original_image_2d is not None:
-                overlay = self.create_attention_overlay_2d(original_image_2d, attention_maps[f'2d_{scale}'])
-                plt.imshow(overlay)
-            else:
-                plt.imshow(attention_maps[f'2d_{scale}'].mean(dim=1).cpu())
-            plt.title(f'2D {scale} attention')
+        try:
+            # Create main figure with improved layout
+            fig = plt.figure(figsize=(20, 15), dpi=self.figure_dpi)
             
-            # 3D attention
-            plt.subplot(2, 3, i + 4)
-            if original_image_3d is not None and f'3d_{scale}_full' in attention_maps:
-                overlays = self.create_attention_overlay_3d(original_image_3d, attention_maps[f'3d_{scale}_full'])
-                plt.imshow(overlays['axial'])  # Show axial view by default
-                plt.title(f'3D {scale} attention (axial)')
-            else:
-                plt.imshow(attention_maps[f'3d_{scale}'].mean(dim=1).cpu())
-                plt.title(f'3D {scale} attention (projected)')
-        
-        visualizations['attention_maps'] = fig_attention
-        
-        # 2. Feature Correlation Visualization
-        for scale in ['cellular', 'tissue', 'organ']:
-            # Handle both 2D and 3D correlations
-            if f'cross_modal_{scale}_3d' in feature_correlations:
-                fig_corr = self.plot_feature_correlations(
-                    feature_correlations[f'cross_modal_{scale}_3d'],
-                    scale,
-                    is_3d=True
+            # Calculate needed columns for feature correlations
+            n_correlations = len(feature_correlations) if feature_correlations else 0
+            n_cols = max(4, n_correlations)  # At least 4 columns, or more if needed
+            gs = GridSpec(3, n_cols, figure=fig)
+            
+            # 1. Original Data Display
+            if original_image_2d is not None:
+                ax_2d = fig.add_subplot(gs[0, 0])
+                self._plot_2d_data(ax_2d, original_image_2d, "2D Input")
+            
+            if original_image_3d is not None:
+                # Create multi-slice grid for 3D data
+                multi_slice_fig = self.create_multi_slice_grid(
+                    original_image_3d,
+                    attention=attention_maps.get('3d_attention'),
+                    num_slices=9
                 )
-                visualizations[f'correlation_{scale}_3d'] = fig_corr
+                results['3d_slices'] = multi_slice_fig
+            
+            # 2. Attention Overlays
+            if attention_maps:
+                # 2D attention overlay
+                if 'attention_2d' in attention_maps:
+                    ax_att_2d = fig.add_subplot(gs[0, 1])
+                    overlay_2d = self.create_attention_overlay_2d(
+                        original_image_2d,
+                        attention_maps['attention_2d']
+                    )
+                    ax_att_2d.imshow(overlay_2d)
+                    ax_att_2d.set_title('2D Attention Map', pad=10)
+                    ax_att_2d.axis('off')
                 
-                fig_corr_proj = self.plot_feature_correlations(
-                    feature_correlations[f'cross_modal_{scale}_proj'],
-                    f'{scale} (projected)'
-                )
-                visualizations[f'correlation_{scale}_proj'] = fig_corr_proj
-            else:
-                fig_corr = self.plot_feature_correlations(
-                    feature_correlations[f'cross_modal_{scale}'],
-                    scale
-                )
-                visualizations[f'correlation_{scale}'] = fig_corr
+                # 3D attention overlays
+                if 'attention_3d' in attention_maps:
+                    overlays_3d = self.create_attention_overlay_3d(
+                        original_image_3d,
+                        attention_maps['attention_3d'],
+                        slices_per_axis=3
+                    )
+                    
+                    # Plot each anatomical plane
+                    for idx, (plane, overlay) in enumerate(overlays_3d.items()):
+                        ax = fig.add_subplot(gs[1, idx])
+                        ax.imshow(overlay)
+                        ax.set_title(f'{plane.capitalize()} View', pad=10)
+                        ax.axis('off')
+            
+            # 3. Feature Correlations
+            if feature_correlations:
+                for idx, (scale, corr) in enumerate(feature_correlations.items()):
+                    if idx >= n_cols:  # Skip if we've run out of columns
+                        print(f"Warning: Skipping correlation plot for {scale} due to space constraints")
+                        continue
+                        
+                    ax_corr = fig.add_subplot(gs[2, idx])
+                    corr_fig = self.plot_feature_correlations(
+                        corr,
+                        scale,
+                        is_3d='3d' in scale.lower(),
+                        enhanced=True
+                    )
+                    
+                    # Copy the correlation plot to the main figure
+                    ax_corr.clear()  # Clear existing content
+                    for child in corr_fig.axes[0].get_children():
+                        if isinstance(child, plt.matplotlib.image.AxesImage):
+                            ax_corr.imshow(child.get_array(), cmap=child.get_cmap())
+                        elif isinstance(child, plt.matplotlib.text.Text):
+                            # Get text position and content
+                            pos = child.get_position()
+                            text = child.get_text()
+                            # Copy text with basic properties
+                            ax_corr.text(pos[0], pos[1], text,
+                                       color=child.get_color(),
+                                       fontsize=child.get_fontsize(),
+                                       ha=child.get_horizontalalignment(),
+                                       va=child.get_verticalalignment())
+                    
+                    # Copy title and labels
+                    ax_corr.set_title(corr_fig.axes[0].get_title())
+                    ax_corr.set_xlabel(corr_fig.axes[0].get_xlabel())
+                    ax_corr.set_ylabel(corr_fig.axes[0].get_ylabel())
+                    plt.close(corr_fig)
+            
+            # Add super title
+            fig.suptitle('Hierarchical Feature Analysis', 
+                        fontsize=16, fontweight='bold', y=0.95)
+            
+            # Adjust layout
+            plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+            
+            results['main_figure'] = fig
+            
+        except Exception as e:
+            print(f"Error in visualization creation: {str(e)}")
+            traceback.print_exc()
+            
+        return results
         
-        # 3. Scale Transition Visualization
-        fig_transition = plt.figure(figsize=(12, 4))
-        for i, (start, end) in enumerate([('cellular', 'tissue'), ('tissue', 'organ')]):
-            plt.subplot(1, 2, i + 1)
-            if f'scale_transition_3d_{start}_to_{end}' in feature_correlations:
-                # Show middle slice of 3D transition
-                transition_3d = feature_correlations[f'scale_transition_3d_{start}_to_{end}']
-                middle_slice = transition_3d.size(0) // 2
-                sns.heatmap(transition_3d[middle_slice].cpu().numpy(), cmap='coolwarm')
-                plt.title(f'3D Scale Transition: {start} → {end}')
-            else:
-                sns.heatmap(
-                    feature_correlations[f'scale_transition_2d_{start}_to_{end}'].cpu().numpy(),
-                    cmap='coolwarm'
-                )
-                plt.title(f'Scale Transition: {start} → {end}')
+    def _plot_2d_data(self, ax, image, title):
+        """Helper method to plot 2D data with enhanced appearance."""
+        if isinstance(image, torch.Tensor):
+            image = image.cpu().numpy()
+            
+        if image.ndim == 4:  # [B, C, H, W]
+            image = image[0]
+        if image.ndim == 3:  # [C, H, W]
+            image = np.transpose(image, (1, 2, 0))
+            
+        # Normalize for display
+        image = (image - image.min()) / (image.max() - image.min())
         
-        visualizations['scale_transitions'] = fig_transition
-        return visualizations
-
+        if image.shape[-1] == 1:
+            ax.imshow(image[..., 0], cmap='gray')
+        else:
+            ax.imshow(image)
+            
+        ax.set_title(title, pad=10)
+        ax.axis('off')
+    
     def plot_3d_feature_responses(self, features: torch.Tensor, save_dir: str):
         """Plot 3D feature responses using volume rendering."""
         try:
@@ -1067,33 +1331,17 @@ class PublicationFigures:
         
         # Calculate error bars (ensure non-negative values)
         def calculate_error_bars(values, ci_low, ci_high):
-            """Calculate error bars ensuring non-negative values and proper scaling."""
             lower_errors = []
             upper_errors = []
             for val, low, high in zip(values, ci_low, ci_high):
-                if np.isnan(val) or val is None:
+                if low is not None and high is not None:
+                    lower_errors.append(max(0, val - low))
+                    upper_errors.append(max(0, high - val))
+                else:
                     lower_errors.append(0)
                     upper_errors.append(0)
-                    continue
-                    
-                # Handle cases where confidence intervals are missing or invalid
-                if low is None or np.isnan(low) or high is None or np.isnan(high):
-                    # Use a small default error (1% of the value)
-                    err = max(0.01 * abs(val), 0.01)
-                    lower_errors.append(err)
-                    upper_errors.append(err)
-                else:
-                    # Ensure errors are non-negative and properly bounded
-                    lower_err = max(0, val - low)
-                    upper_err = max(0, high - val)
-                    
-                    # Cap errors at the valid range (0-1 for both AUC and normalized accuracy)
-                    lower_errors.append(min(lower_err, val))
-                    upper_errors.append(min(upper_err, 1.0 - val))
-            
             return np.array([lower_errors, upper_errors])
         
-        # Calculate error bars with the improved function
         auc_yerr = calculate_error_bars(
             aucs,
             [m[3] if m[3] is not None else m[1] for m in metrics],
@@ -1106,16 +1354,15 @@ class PublicationFigures:
             [m[6]/100.0 if m[6] is not None else m[2]/100.0 for m in metrics]
         )
         
-        # Create figure with improved error bar handling
+        # Set up bar positions
         x = np.arange(len(datasets))
         width = 0.35
         
-        # Create bars with refined styling and error bars
+        # Create bars with refined styling and publication colors
         rects1 = ax.bar(x - width/2, aucs, width, label='AUC',
                        color='#4C72B0', edgecolor='black',
                        linewidth=0.5, alpha=0.8,
-                       yerr=auc_yerr, capsize=3,
-                       error_kw={'elinewidth': 0.5, 'capthick': 0.5})
+                       yerr=auc_yerr, capsize=3, error_kw={'elinewidth': 0.5, 'capthick': 0.5})
         rects2 = ax.bar(x + width/2, accs, width, label='Accuracy',
                        color='#55A868', edgecolor='black',
                        linewidth=0.5, alpha=0.8,
@@ -1393,141 +1640,6 @@ class PublicationFigures:
         finally:
             plt.close('all')
 
-class AnatomicalVizEngine3D:
-    """Enhanced visualization engine for 3D anatomical interpretability"""
-    def __init__(self):
-        self.cmap = plt.cm.viridis
-        self.figsize = (15, 10)
-        
-    def plot_anatomical_attention(self, attention_maps, features, slice_idx=None):
-        """Plot anatomical attention maps with plane-specific views"""
-        fig = plt.figure(figsize=(15, 12))
-        gs = plt.GridSpec(3, 4)
-        
-        # Get middle slice if not specified
-        if slice_idx is None:
-            slice_idx = {
-                'axial': features.shape[2] // 2,
-                'sagittal': features.shape[3] // 2,
-                'coronal': features.shape[4] // 2
-            }
-        
-        # Plot original feature volume
-        ax_vol = fig.add_subplot(gs[0, 0], projection='3d')
-        self.plot_3d_volume(ax_vol, features.mean(1)[0], 'Feature Volume')
-        
-        # Plot anatomical plane attention
-        planes = ['axial', 'sagittal', 'coronal']
-        slices = {
-            'axial': lambda x: x[:, :, slice_idx['axial'], :, :],
-            'sagittal': lambda x: x[:, :, :, slice_idx['sagittal'], :],
-            'coronal': lambda x: x[:, :, :, :, slice_idx['coronal']]
-        }
-        
-        for i, plane in enumerate(planes):
-            # Plot attention map
-            ax_att = fig.add_subplot(gs[0, i+1])
-            att_map = attention_maps[plane][0, 0].detach().cpu()
-            plt.imshow(att_map, cmap='hot')
-            plt.title(f'{plane.capitalize()} Attention')
-            plt.colorbar()
-            
-            # Plot feature slice with attention overlay
-            ax_feat = fig.add_subplot(gs[1, i])
-            feat_slice = slices[plane](features)[0].mean(0).detach().cpu()
-            plt.imshow(feat_slice, cmap='gray')
-            plt.imshow(att_map, cmap='hot', alpha=0.5)
-            plt.title(f'{plane.capitalize()} Features + Attention')
-            
-            # Plot attended features
-            ax_attended = fig.add_subplot(gs[2, i])
-            attended_feat = feat_slice * att_map
-            plt.imshow(attended_feat, cmap=self.cmap)
-            plt.title(f'Attended {plane.capitalize()} Features')
-            plt.colorbar()
-        
-        plt.tight_layout()
-        return fig
-
-    def plot_3d_hierarchy(self, features_dict, attention_dict):
-        """Plot 3D hierarchical visualization with volume plots."""
-        try:
-            fig = plt.figure(figsize=(20, 15))
-            n_levels = len(hierarchical_viz)
-            gs = plt.GridSpec(2, n_levels)
-            
-            for i, (title, data) in enumerate(hierarchical_viz.items()):
-                # Convert to numpy and ensure 3D
-                if torch.is_tensor(data):
-                    data = data.detach().cpu().numpy()
-                if data.ndim == 2:
-                    data = data.reshape(int(np.cbrt(data.size)), -1, -1)
-                
-                # 3D Volume Plot
-                ax_3d = fig.add_subplot(gs[0, i], projection='3d')
-                
-                # Create volume plot
-                x, y, z = np.meshgrid(
-                    np.arange(data.shape[0]),
-                    np.arange(data.shape[1]),
-                    np.arange(data.shape[2])
-                )
-                
-                # Normalize and threshold
-                data_norm = (data - data.min()) / (data.max() - data.min() + 1e-8)
-                threshold = np.percentile(data_norm, 75)
-                mask = data_norm > threshold
-                
-                # Create scatter plot with enhanced visibility
-                scatter = ax_3d.scatter(
-                    x[mask], y[mask], z[mask],
-                    c=data_norm[mask],
-                    cmap='viridis',
-                    alpha=0.6,
-                    s=50
-                )
-                
-                # Enhance 3D visualization
-                cbar = plt.colorbar(scatter, ax=ax_3d)
-                cbar.set_label('Feature Response Intensity', fontsize=10)
-                ax_3d.view_init(elev=20, azim=45)
-                ax_3d.set_xlabel('Depth (D)', fontsize=10)
-                ax_3d.set_ylabel('Height (H)', fontsize=10)
-                ax_3d.set_zlabel('Width (W)', fontsize=10)
-                ax_3d.grid(True, alpha=0.3)
-                ax_3d.set_title('3D Feature Response Volume', fontsize=12, pad=20)
-                
-                # 2. Anatomical Plane Views
-                # Axial View (top-down)
-                ax_axial = fig.add_subplot(gs[1, 0])
-                mid_slice = data.shape[0] // 2
-                im_axial = ax_axial.imshow(data[mid_slice], cmap='viridis')
-                plt.colorbar(im_axial, ax=ax_axial)
-                ax_axial.set_title(f'Axial View (z={mid_slice})', fontsize=12)
-                
-                # Sagittal View (side)
-                ax_sagittal = fig.add_subplot(gs[1, 1])
-                mid_slice = data.shape[1] // 2
-                im_sagittal = ax_sagittal.imshow(data[:, mid_slice], cmap='viridis')
-                plt.colorbar(im_sagittal, ax=ax_sagittal)
-                ax_sagittal.set_title(f'Sagittal View (y={mid_slice})', fontsize=12)
-                
-                # Coronal View (front)
-                ax_coronal = fig.add_subplot(gs[1, 2])
-                mid_slice = data.shape[2] // 2
-                im_coronal = ax_coronal.imshow(data[:, :, mid_slice], cmap='viridis')
-                plt.colorbar(im_coronal, ax=ax_coronal)
-                ax_coronal.set_title(f'Coronal View (x={mid_slice})', fontsize=12)
-                
-                plt.tight_layout(pad=3.0)
-                plt.savefig(os.path.join(save_dir, f'3d_feature_response_{i+1}.png'), 
-                           dpi=300, bbox_inches='tight')
-                plt.close()
-                
-        except Exception as e:
-            print(f"Error in 3D hierarchical visualization: {str(e)}")
-            traceback.print_exc()
-
 def enhance_and_save_plot(src_file, dst_file):
     """Enhance and save a plot with publication-quality settings."""
     try:
@@ -1555,274 +1667,122 @@ def enhance_and_save_plot(src_file, dst_file):
         return False
 
 def generate_publication_figures(results_dir):
-    """Generate publication-ready figures from training results with robust error handling."""
+    """Generate publication-ready figures from training results."""
     print("\nGenerating publication-ready figures...")
     
     paper_figures_dir = os.path.join(results_dir, 'paper_figures')
     os.makedirs(paper_figures_dir, exist_ok=True)
     
-    # Track successful and failed figure generations
-    generated_figures = {
-        '2d_performance': False,
-        '3d_performance': False,
-        'combined_performance': False
-    }
-    
     try:
-        # Load results with error handling
-        try:
-            with open(os.path.join(results_dir, 'all_results.json'), 'r') as f:
-                all_results = json.load(f)
-        except Exception as e:
-            print(f"Error loading results file: {str(e)}")
-            print("Attempting to proceed with empty results...")
-            all_results = {}
+        # Load all results
+        with open(os.path.join(results_dir, 'all_results.json'), 'r') as f:
+            all_results = json.load(f)
         
-        # Separate 2D and 3D datasets with validation
-        results_2d = {}
-        results_3d = {}
-        
-        for k, v in all_results.items():
-            try:
-                if v.get('status') != 'success':
-                    continue
-                    
-                # Validate required metrics exist
-                if not all(key in v for key in ['final_val_acc', 'final_val_auc']):
-                    print(f"Warning: Missing metrics for {k}, skipping...")
-                    continue
-                
-                if '3d' in k.lower():
-                    results_3d[k] = v
-                else:
-                    results_2d[k] = v
-            except Exception as e:
-                print(f"Warning: Error processing dataset {k}: {str(e)}")
-                continue
+        # Separate 2D and 3D datasets
+        results_2d = {k: v for k, v in all_results.items() if '3d' not in k.lower()}
+        results_3d = {k: v for k, v in all_results.items() if '3d' in k.lower()}
         
         def create_performance_plot(results, title, is_3d=False):
-            """Create performance plot with enhanced error handling."""
-            try:
-                if not results:
-                    print(f"Warning: No valid results for {'3D' if is_3d else '2D'} performance plot")
-                    return None
-                
-                datasets = []
-                metrics = {'acc': [], 'auc': []}
-                ci_metrics = {'acc': {'lower': [], 'upper': []}, 
-                             'auc': {'lower': [], 'upper': []}}
-                
-                # Process each dataset with individual error handling
-                for dataset, result in results.items():
-                    try:
-                        # Basic metric validation
-                        acc = result.get('final_val_acc', 0) / 100.0
-                        auc = result.get('final_val_auc', 0.5)
-                        
-                        if not (0 <= acc <= 1) or not (0 <= auc <= 1):
-                            print(f"Warning: Invalid metrics for {dataset}, using fallback values")
-                            acc = max(0, min(1, acc))
-                            auc = max(0, min(1, auc))
-                        
-                        datasets.append(dataset.replace('mnist', '').replace('3d', ''))
-                        metrics['acc'].append(acc)
-                        metrics['auc'].append(auc)
-                        
-                        # Handle confidence intervals with fallbacks
-                        ci = result.get('ci_metrics', {})
-                        for metric_name in ['acc', 'auc']:
-                            metric_ci = ci.get(metric_name, {})
-                            current_val = metrics[metric_name][-1]
-                            
-                            # Ensure CI values are valid
-                            ci_low = metric_ci.get('ci_low', current_val)
-                            ci_high = metric_ci.get('ci_high', current_val)
-                            
-                            if metric_name == 'acc':
-                                ci_low = ci_low / 100.0 if ci_low is not None else current_val
-                                ci_high = ci_high / 100.0 if ci_high is not None else current_val
-                            
-                            # Validate and bound CI values
-                            ci_low = max(0, min(current_val, ci_low if not np.isnan(ci_low) else current_val))
-                            ci_high = min(1, max(current_val, ci_high if not np.isnan(ci_high) else current_val))
-                            
-                            ci_metrics[metric_name]['lower'].append(ci_low)
-                            ci_metrics[metric_name]['upper'].append(ci_high)
-                            
-                    except Exception as e:
-                        print(f"Warning: Error processing {dataset}: {str(e)}")
-                        continue
-                
-                if not datasets:
-                    return None
-                
-                # Create figure with error handling
-                fig = plt.figure(figsize=(12, 6))
-                x = np.arange(len(datasets))
-                width = 0.35
-                
-                def plot_metric_bars(metric_name, offset, color):
-                    try:
-                        yerr = np.array([
-                            np.array(metrics[metric_name]) - np.array(ci_metrics[metric_name]['lower']),
-                            np.array(ci_metrics[metric_name]['upper']) - np.array(metrics[metric_name])
-                        ])
-                        
-                        # Ensure no negative error bars
-                        yerr = np.maximum(0, yerr)
-                        
-                        plt.bar(x + offset, metrics[metric_name], width,
-                               label=metric_name.upper(),
-                               color=color, alpha=0.8,
-                               yerr=yerr, capsize=5,
-                               error_kw={'elinewidth': 1, 'capthick': 1})
-                    except Exception as e:
-                        print(f"Warning: Error plotting {metric_name} bars: {str(e)}")
-                        # Fallback to simple bars without error bars
-                        plt.bar(x + offset, metrics[metric_name], width,
-                               label=metric_name.upper(),
-                               color=color, alpha=0.8)
-                
-                # Plot with individual error handling
-                try:
-                    plot_metric_bars('acc', -width/2, '#3498db')
-                except Exception as e:
-                    print(f"Warning: Error plotting accuracy bars: {str(e)}")
-                
-                try:
-                    plot_metric_bars('auc', width/2, '#2ecc71')
-                except Exception as e:
-                    print(f"Warning: Error plotting AUC bars: {str(e)}")
-                
-                # Customize plot with error handling
-                plt.xlabel('Dataset')
-                plt.ylabel('Score')
-                plt.title(f'{title} ({"3D" if is_3d else "2D"} Datasets)')
-                plt.xticks(x, datasets, rotation=45, ha='right')
-                plt.legend(loc='lower right')
-                plt.grid(True, alpha=0.3)
-                plt.ylim(0, 1.0)
-                
-                # Add value labels with error handling
-                def add_value_labels(metric_name, offset):
-                    try:
-                        for i, v in enumerate(metrics[metric_name]):
-                            plt.text(i + offset, v + 0.02,
-                                    f'{v:.2f}',
-                                    ha='center', va='bottom',
-                                    fontsize=8)
-                    except Exception as e:
-                        print(f"Warning: Error adding value labels for {metric_name}: {str(e)}")
-                
-                add_value_labels('acc', -width/2)
-                add_value_labels('auc', width/2)
-                
-                plt.tight_layout()
-                return fig
-                
-            except Exception as e:
-                print(f"Error creating performance plot: {str(e)}")
+            """Create performance plot with confidence intervals."""
+            datasets = []
+            metrics = {'acc': [], 'auc': []}
+            ci_metrics = {'acc': {'lower': [], 'upper': []}, 
+                         'auc': {'lower': [], 'upper': []}}
+            
+            for dataset, result in results.items():
+                if result['status'] == 'success':
+                    datasets.append(dataset.replace('mnist', '').replace('3d', ''))
+                    
+                    # Get metrics
+                    metrics['acc'].append(result['final_val_acc'] / 100.0)  # Convert to [0,1]
+                    metrics['auc'].append(result['final_val_auc'])
+                    
+                    # Get confidence intervals
+                    ci = result.get('ci_metrics', {})
+                    acc_ci = ci.get('acc', {})
+                    auc_ci = ci.get('auc', {})
+                    
+                    # Handle accuracy CIs
+                    if acc_ci and not np.isnan(acc_ci.get('ci_low', np.nan)):
+                        ci_metrics['acc']['lower'].append(acc_ci['ci_low'] / 100.0)
+                        ci_metrics['acc']['upper'].append(acc_ci['ci_high'] / 100.0)
+                    else:
+                        ci_metrics['acc']['lower'].append(metrics['acc'][-1])
+                        ci_metrics['acc']['upper'].append(metrics['acc'][-1])
+                    
+                    # Handle AUC CIs
+                    if auc_ci and not np.isnan(auc_ci.get('ci_low', np.nan)):
+                        ci_metrics['auc']['lower'].append(auc_ci['ci_low'])
+                        ci_metrics['auc']['upper'].append(auc_ci['ci_high'])
+                    else:
+                        ci_metrics['auc']['lower'].append(metrics['auc'][-1])
+                        ci_metrics['auc']['upper'].append(metrics['auc'][-1])
+            
+            if not datasets:
                 return None
+                
+            # Create figure
+            plt.figure(figsize=(12, 6))
+            x = np.arange(len(datasets))
+            width = 0.35
+            
+            # Plot bars with error bars
+            def plot_metric_bars(metric_name, offset, color):
+                yerr = np.array([
+                    np.array(metrics[metric_name]) - np.array(ci_metrics[metric_name]['lower']),
+                    np.array(ci_metrics[metric_name]['upper']) - np.array(metrics[metric_name])
+                ])
+                
+                plt.bar(x + offset, metrics[metric_name], width,
+                       label=metric_name.upper(),
+                       color=color, alpha=0.8,
+                       yerr=yerr, capsize=5,
+                       error_kw={'elinewidth': 1, 'capthick': 1})
+            
+            plot_metric_bars('acc', -width/2, '#3498db')
+            plot_metric_bars('auc', width/2, '#2ecc71')
+            
+            # Customize plot
+            plt.xlabel('Dataset')
+            plt.ylabel('Score')
+            plt.title(f'{title} ({"3D" if is_3d else "2D"} Datasets)')
+            plt.xticks(x, datasets, rotation=45, ha='right')
+            plt.legend(loc='lower right')
+            plt.grid(True, alpha=0.3)
+            plt.ylim(0, 1.0)
+            
+            # Add value labels
+            def add_value_labels(metric_name, offset):
+                for i, v in enumerate(metrics[metric_name]):
+                    plt.text(i + offset, v + 0.02,
+                            f'{v:.2f}',
+                            ha='center', va='bottom',
+                            fontsize=8)
+            
+            add_value_labels('acc', -width/2)
+            add_value_labels('auc', width/2)
+            
+            plt.tight_layout()
+            return plt.gcf()
         
         # Generate and save 2D performance plot
-        try:
-            fig_2d = create_performance_plot(results_2d, 'Performance Metrics', is_3d=False)
-            if fig_2d:
-                fig_2d.savefig(os.path.join(paper_figures_dir, '2d_performance.png'),
-                              dpi=300, bbox_inches='tight')
-                generated_figures['2d_performance'] = True
-                plt.close(fig_2d)
-        except Exception as e:
-            print(f"Error saving 2D performance plot: {str(e)}")
+        fig_2d = create_performance_plot(results_2d, 'Performance Metrics', is_3d=False)
+        if fig_2d:
+            fig_2d.savefig(os.path.join(paper_figures_dir, '2d_performance.png'),
+                          dpi=300, bbox_inches='tight')
+            plt.close(fig_2d)
         
         # Generate and save 3D performance plot
-        try:
-            fig_3d = create_performance_plot(results_3d, 'Performance Metrics', is_3d=True)
-            if fig_3d:
-                fig_3d.savefig(os.path.join(paper_figures_dir, '3d_performance.png'),
-                              dpi=300, bbox_inches='tight')
-                generated_figures['3d_performance'] = True
-                plt.close(fig_3d)
-        except Exception as e:
-            print(f"Error saving 3D performance plot: {str(e)}")
+        fig_3d = create_performance_plot(results_3d, 'Performance Metrics', is_3d=True)
+        if fig_3d:
+            fig_3d.savefig(os.path.join(paper_figures_dir, '3d_performance.png'),
+                          dpi=300, bbox_inches='tight')
+            plt.close(fig_3d)
         
-        # Generate combined performance comparison
-        try:
-            plt.figure(figsize=(15, 8))
-            datasets = []
-            val_accs = []
-            val_aucs = []
-            
-            for dataset, result in all_results.items():
-                try:
-                    if result.get('status') != 'success':
-                        continue
-                    
-                    acc = result.get('final_val_acc', 0) / 100.0
-                    auc = result.get('final_val_auc', 0.5)
-                    
-                    # Validate metrics
-                    if not (0 <= acc <= 1) or not (0 <= auc <= 1):
-                        acc = max(0, min(1, acc))
-                        auc = max(0, min(1, auc))
-                    
-                    datasets.append(dataset.replace('mnist', '').replace('3d', ''))
-                    val_accs.append(acc)
-                    val_aucs.append(auc)
-                except Exception as e:
-                    print(f"Warning: Error processing dataset {dataset} for combined plot: {str(e)}")
-                    continue
-            
-            if datasets:
-                x = np.arange(len(datasets))
-                width = 0.35
-                
-                plt.bar(x - width/2, val_accs, width, label='Accuracy',
-                       color='#3498db', alpha=0.8)
-                plt.bar(x + width/2, val_aucs, width, label='AUC',
-                       color='#2ecc71', alpha=0.8)
-                
-                plt.xlabel('Dataset')
-                plt.ylabel('Score')
-                plt.title('Performance Comparison Across All Datasets')
-                plt.xticks(x, datasets, rotation=45, ha='right')
-                plt.legend(loc='lower right')
-                plt.grid(True, alpha=0.3)
-                plt.ylim(0, 1.0)
-                
-                # Add value labels
-                for i, v in enumerate(val_accs):
-                    plt.text(i - width/2, v + 0.02, f'{v:.2f}',
-                            ha='center', va='bottom', fontsize=8)
-                for i, v in enumerate(val_aucs):
-                    plt.text(i + width/2, v + 0.02, f'{v:.2f}',
-                            ha='center', va='bottom', fontsize=8)
-                
-                plt.tight_layout()
-                plt.savefig(os.path.join(paper_figures_dir, 'performance_comparison.png'),
-                           dpi=300, bbox_inches='tight')
-                generated_figures['combined_performance'] = True
-                plt.close()
-        except Exception as e:
-            print(f"Error generating combined performance plot: {str(e)}")
-        
-        # Report generation status
-        print("\nFigure generation summary:")
-        for fig_name, success in generated_figures.items():
-            print(f"{fig_name}: {'✓ Success' if success else '✗ Failed'}")
-        
-        if any(generated_figures.values()):
-            print("\nPublication figures generated successfully (some figures may have failed).")
-            print(f"Figures saved in: {paper_figures_dir}")
-        else:
-            print("\nWarning: No figures were successfully generated.")
+        print("Publication figures generated successfully.")
         
     except Exception as e:
-        print(f"Error in publication figure generation: {str(e)}")
+        print(f"Error generating publication figures: {str(e)}")
         traceback.print_exc()
     finally:
-        # Ensure cleanup
-        try:
-            plt.close('all')
-        except:
-            pass
+        plt.close('all')
