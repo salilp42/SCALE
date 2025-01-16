@@ -1,0 +1,65 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs and databases
+*.log
+*.sqlite
+training_*.log
+training_debug*.log
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Model checkpoints and results
+checkpoints/
+runs/
+results/
+output/
+
+# LaTeX
+*.aux
+*.bbl
+*.blg
+*.log
+*.out
+*.pdf
+*.tex
+*.toc
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Misc
+.Rhistory
+all_results.json 
